@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +13,58 @@ import (
 
 	"github.com/cloudfoundry/libbuildpack"
 )
+
+type interceptingWriter struct {
+	io.Writer
+	buf bytes.Buffer
+}
+
+func newInterceptingWriter(writer io.Writer) *interceptingWriter {
+	return &interceptingWriter{
+		Writer: writer,
+	}
+}
+
+func (w *interceptingWriter) Write(p []byte) (n int, err error) {
+	w.buf.Write(p)
+	return w.Writer.Write(p)
+}
+
+type loggingCommand struct {
+	command apt.Command
+	logger  *libbuildpack.Logger
+}
+
+func newLoggingCommand(command apt.Command, logger *libbuildpack.Logger) *loggingCommand {
+	return &loggingCommand{
+		command: command,
+		logger:  logger,
+	}
+}
+
+func (c *loggingCommand) Output(dir string, program string, args ...string) (string, error) {
+	c.logger.Debug("Running %s %v in %s", program, args, dir)
+	out, err := c.command.Output(dir, program, args...)
+	if err != nil {
+		c.logger.Error("%s %v failed: %v\n%s", program, args, err, out)
+	} else {
+		c.logger.Debug("\n%s", out)
+	}
+	return out, err
+}
+
+func (c *loggingCommand) Execute(dir string, stdout io.Writer, stderr io.Writer, program string, args ...string) error {
+	c.logger.Debug("Running %s %v in %s", program, args, dir)
+	_stdout := newInterceptingWriter(stdout)
+	_stderr := newInterceptingWriter(stderr)
+	err := c.command.Execute(dir, _stdout, _stderr, program, args...)
+	if err != nil {
+		c.logger.Error("%s %v failed: %v\n%s", program, args, err, _stdout.buf.String(), _stderr.buf.String())
+	} else {
+		c.logger.Debug("\n%s", _stdout.buf.String(), _stderr.buf.String())
+	}
+	return err
+}
 
 func main() {
 	logger := libbuildpack.NewLogger(os.Stdout)
@@ -60,7 +114,7 @@ func main() {
 		os.Exit(17)
 	}
 
-	command := &libbuildpack.Command{}
+	command := newLoggingCommand(&libbuildpack.Command{}, logger)
 	a := apt.New(command, filepath.Join(stager.BuildDir(), "apt.yml"), "/etc/apt", stager.CacheDir(), filepath.Join(stager.DepDir(), "apt"))
 	if err := a.Setup(); err != nil {
 		logger.Error("Unable to initialize apt package: %s", err.Error())
